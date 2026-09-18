@@ -41,6 +41,22 @@ class SeatHold(Base):
     showtime: Mapped[Showtime] = relationship(back_populates="holds")
 
 
+class HoldToken(Base):
+    """Short-lived precheck credential: coordinates are computed, not yet held."""
+
+    __tablename__ = "hold_tokens"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    token: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    showtime_id: Mapped[int] = mapped_column(ForeignKey("showtimes.id"))
+    party_size: Mapped[int] = mapped_column(Integer)
+    row: Mapped[int] = mapped_column(Integer)
+    start_col: Mapped[int] = mapped_column(Integer)
+    end_col: Mapped[int] = mapped_column(Integer)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class ConflictLog(Base):
     __tablename__ = "conflict_logs"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
