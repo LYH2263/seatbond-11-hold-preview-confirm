@@ -41,6 +41,22 @@ class SeatHold(Base):
     showtime: Mapped[Showtime] = relationship(back_populates="holds")
 
 
+class HoldToken(Base):
+    """预检确认令牌：短时有效、仅可成功确认一次，本身不代表持座。"""
+
+    __tablename__ = "hold_tokens"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    token: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    showtime_id: Mapped[int] = mapped_column(ForeignKey("showtimes.id"))
+    row: Mapped[int] = mapped_column(Integer)
+    start_col: Mapped[int] = mapped_column(Integer)
+    end_col: Mapped[int] = mapped_column(Integer)
+    party_size: Mapped[int] = mapped_column(Integer)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class ConflictLog(Base):
     __tablename__ = "conflict_logs"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)

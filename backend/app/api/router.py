@@ -1,16 +1,20 @@
-from datetime import datetime
+import secrets
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.database import get_db
-from app.models.models import ConflictLog, Hall, SeatHold, Showtime
+from app.models.models import ConflictLog, Hall, HoldToken, SeatHold, Showtime
 from app.schemas.schemas import (
+    ConfirmRequest,
     ConflictOut,
     HallOut,
     HoldOut,
-    HoldRequest,
+    PrecheckOut,
+    PrecheckRequest,
     SeatMapCell,
     SeatMapOut,
     ShowtimeOut,
@@ -110,16 +114,22 @@ def list_conflicts(db: Session = Depends(get_db)):
     return db.scalars(select(ConflictLog).order_by(ConflictLog.id.desc())).all()
 
 
-@api_router.post("/holds", response_model=HoldOut)
-def create_hold(body: HoldRequest, db: Session = Depends(get_db)):
-    st = db.get(Showtime, body.showtime_id)
+def _hold_spans(db: Session, showtime_id: int) -> list[HoldSpan]:
+    existing = db.scalars(select(SeatHold).where(SeatHold.showtime_id == showtime_id)).all()
+    return [HoldSpan(row=h.row, start_col=h.start_col, end_col=h.end_col) for h in existing]
+
+
+def _find_block(
+    db: Session, showtime_id: int, party_size: int, preferred_row: int | None
+) -> HoldSpan | None:
+    """沿用现网搜索规则：优先排先行，过道打断，按排号升序取最左连续空段。"""
+    st = db.get(Showtime, showtime_id)
     if not st:
         raise HTTPException(404, "场次不存在")
     hall = db.get(Hall, st.hall_id)
     assert hall
     aisles = set(_aisles(hall))
-    existing = db.scalars(select(SeatHold).where(SeatHold.showtime_id == body.showtime_id)).all()
-    holds = [HoldSpan(row=h.row, start_col=h.start_col, end_col=h.end_col) for h in existing]
+    holds = _hold_spans(db, showtime_id)
     seats_by_row: dict[int, list[SeatCell]] = {}
     for r in range(1, hall.rows + 1):
         seats_by_row[r] = [
@@ -127,12 +137,19 @@ def create_hold(body: HoldRequest, db: Session = Depends(get_db)):
         ]
 
     block = None
-    if body.preferred_row:
+    if preferred_row:
         block = find_contiguous_block(
-            seats_by_row.get(body.preferred_row, []), holds, body.preferred_row, body.party_size
+            seats_by_row.get(preferred_row, []), holds, preferred_row, party_size
         )
     if block is None:
-        block = find_bond_across_rows(seats_by_row, holds, body.party_size)
+        block = find_bond_across_rows(seats_by_row, holds, party_size)
+    return block
+
+
+@api_router.post("/holds/precheck", response_model=PrecheckOut)
+def precheck_hold(body: PrecheckRequest, db: Session = Depends(get_db)):
+    """预检：算出将占用的排与起止列并发短时确认令牌；不写持座，座位图热力不变。"""
+    block = _find_block(db, body.showtime_id, body.party_size, body.preferred_row)
     if block is None:
         db.add(
             ConflictLog(
@@ -144,27 +161,72 @@ def create_hold(body: HoldRequest, db: Session = Depends(get_db)):
         db.commit()
         raise HTTPException(409, "无足够连续空座")
 
-    hits = conflicts_with(holds, block)
-    if hits:
-        db.add(
-            ConflictLog(
-                showtime_id=body.showtime_id,
-                party_size=body.party_size,
-                reason=f"与既有持座重叠：第{hits[0].row}排 {hits[0].start_col}-{hits[0].end_col}",
-            )
-        )
-        db.commit()
-        raise HTTPException(409, "与既有持座冲突")
-
-    code = f"SB-{int(datetime.utcnow().timestamp()) % 100000:05d}"
-    hold = SeatHold(
+    tok = HoldToken(
+        token=secrets.token_urlsafe(24),
         showtime_id=body.showtime_id,
-        order_code=code,
         row=block.row,
         start_col=block.start_col,
         end_col=block.end_col,
         party_size=body.party_size,
+        expires_at=datetime.utcnow() + timedelta(seconds=settings.hold_token_ttl_seconds),
     )
+    db.add(tok)
+    db.commit()
+    return PrecheckOut(
+        token=tok.token,
+        showtime_id=tok.showtime_id,
+        row=tok.row,
+        start_col=tok.start_col,
+        end_col=tok.end_col,
+        party_size=tok.party_size,
+        expires_at=tok.expires_at,
+    )
+
+
+@api_router.post("/holds/confirm", response_model=HoldOut)
+def confirm_hold(body: ConfirmRequest, db: Session = Depends(get_db)):
+    """确认：令牌有效且目标座位仍空闲才落库；令牌仅可成功确认一次。"""
+    tok = db.scalar(select(HoldToken).where(HoldToken.token == body.token))
+    if tok is None:
+        raise HTTPException(404, "确认令牌不存在，请重新预检")
+    if tok.used_at is not None:
+        raise HTTPException(409, "该令牌已确认过，请重新预检")
+
+    now = datetime.utcnow()
+    if tok.expires_at <= now:
+        db.add(
+            ConflictLog(
+                showtime_id=tok.showtime_id,
+                party_size=tok.party_size,
+                reason=f"确认令牌已过期：第{tok.row}排 {tok.start_col}-{tok.end_col}",
+            )
+        )
+        db.commit()
+        raise HTTPException(409, "确认令牌已过期，请重新预检")
+
+    block = HoldSpan(row=tok.row, start_col=tok.start_col, end_col=tok.end_col)
+    hits = conflicts_with(_hold_spans(db, tok.showtime_id), block)
+    if hits:
+        db.add(
+            ConflictLog(
+                showtime_id=tok.showtime_id,
+                party_size=tok.party_size,
+                reason=f"确认时目标座位已被占用：第{hits[0].row}排 {hits[0].start_col}-{hits[0].end_col}",
+            )
+        )
+        db.commit()
+        raise HTTPException(409, "目标座位已被他人占用，请重新预检")
+
+    code = f"SB-{int(datetime.utcnow().timestamp()) % 100000:05d}"
+    hold = SeatHold(
+        showtime_id=tok.showtime_id,
+        order_code=code,
+        row=block.row,
+        start_col=block.start_col,
+        end_col=block.end_col,
+        party_size=tok.party_size,
+    )
+    tok.used_at = now
     db.add(hold)
     db.commit()
     db.refresh(hold)

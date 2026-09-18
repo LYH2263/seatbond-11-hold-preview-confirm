@@ -32,10 +32,24 @@ class HoldOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
-class HoldRequest(BaseModel):
+class PrecheckRequest(BaseModel):
     showtime_id: int
     party_size: int = Field(ge=1, le=12)
     preferred_row: int | None = None
+
+
+class PrecheckOut(BaseModel):
+    token: str
+    showtime_id: int
+    row: int
+    start_col: int
+    end_col: int
+    party_size: int
+    expires_at: datetime
+
+
+class ConfirmRequest(BaseModel):
+    token: str
 
 
 class ConflictOut(BaseModel):
